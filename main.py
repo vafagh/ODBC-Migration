@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 from dotenv import load_dotenv
 from db_operations import connect_odbc, connect_mysql, migrate_table, close_connections
 
@@ -27,16 +28,9 @@ logging.basicConfig(
 
 logging.info("Script started")
 
-# Define table mappings for migration
-table_mappings = [
-    {"source": "BKARINV", "destination": "BKARINV"},
-    {"source": "BKARINVL", "destination": "BKARINVL"},
-    {"source": "BKAPPO", "destination": "BKAPPO"},
-    # {"source": "BKAPPOL", "destination": "BKAPPOL"},
-    # {"source": "BKICMSTR", "destination": "BKICMSTR"},
-    # {"source": "BKICLOC", "destination": "BKICLOC"},
-    # {"source": "BKARCUST", "destination": "BKARCUST"}
-]
+# Load table mappings from external JSON file
+with open('table_mappings.json', 'r') as f:
+    table_mappings = json.load(f)["table_mappings"]
 
 try:
     # Connect to ODBC and MySQL

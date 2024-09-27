@@ -35,7 +35,9 @@ The main dependencies are:
 
 - `main_script.py`: The entry point for the script that handles the migration process.
 - `db_operations.py`: Contains helper functions for connecting to databases, creating MySQL tables, and migrating data.
+- `table_mappings.json`: Stores the mapping of ODBC source tables to MySQL destination tables.
 - `.env`: Configuration file containing database connection credentials and other settings.
+- `.gitignore`: Ensures sensitive files like `.env` and `table_mappings.json` are not tracked by Git.
 - `requirements.txt`: Lists all Python dependencies.
 
 ## Setup
@@ -72,14 +74,27 @@ LOG_FILE_PATH=path_to_your_log_file.log
 LOG_LEVEL=INFO
 ```
 
-4. Modify `table_mappings` in `main_script.py` to reflect your ODBC source tables and their corresponding MySQL destination tables. Example:
+4. Create a `table_mappings.json` file in the root directory with the following structure:
 
-```python
-table_mappings = [
-    {"source": "BKARINV", "destination": "invoices"},
-    {"source": "BKICMSTR", "destination": "products"},
-    # Add more table mappings as needed
-]
+```json
+{
+  "table_mappings": [
+    { "source": "INV", "destination": "invoices" },
+    { "source": "INVL", "destination": "invoiceLine" },
+    { "source": "PO", "destination": "purchase" },
+    { "source": "POL", "destination": "purchaseLine" },
+    { "source": "MSTR", "destination": "products" },
+    { "source": "LOC", "destination": "productsLoc" },
+    { "source": "CUST", "destination": "locations" }
+  ]
+}
+```
+
+5. Ensure the `.env` and `table_mappings.json` files are added to your `.gitignore` to avoid sharing sensitive information:
+
+```bash
+echo '.env' >> .gitignore
+echo 'table_mappings.json' >> .gitignore
 ```
 
 ## Usage
@@ -87,12 +102,12 @@ table_mappings = [
 Run the migration script using Python:
 
 ```bash
-python main_script.py
+python main.py
 ```
 
 The script will:
 1. Connect to the ODBC source and MySQL database.
-2. Fetch data from the specified ODBC tables.
+2. Fetch data from the specified ODBC tables (using the mappings from `table_mappings.json`).
 3. Dynamically create MySQL tables (if they don’t exist) based on the ODBC schema.
 4. Insert or update rows in MySQL, avoiding duplicates.
 5. Add `created_at` and `updated_at` timestamps to each row.
