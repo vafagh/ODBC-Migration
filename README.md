@@ -43,8 +43,8 @@ The main dependencies are:
 1. Clone this repository to your local machine:
 
 ```bash
-git clone https://github.com/yourusername/odbc-to-mysql-migration-tool.git
-cd odbc-to-mysql-migration-tool
+git clone https://github.com/vafagh/ODBC-Migration.git
+cd ODBC-Migration
 ```
 
 2. Install the required Python dependencies:
