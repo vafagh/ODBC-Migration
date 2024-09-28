@@ -1,11 +1,16 @@
 {
   "table_mappings": [
-    { "source": "INV", "destination": "invoices" },
-    { "source": "INVL", "destination": "invoiceLine" },
-    { "source": "PO", "destination": "purchase" },
-    { "source": "POL", "destination": "purchaseLine" },
-    { "source": "MSTR", "destination": "products" },
-    { "source": "LOC", "destination": "productsLoc" },
-    { "source": "CUST", "destination": "locations" }
+    {
+      "source": "BKARINV",
+      "destination": "BKARINV",
+      "exceptions": {
+        "BKAR_INV_JOBCOD": "TIME"
+      }
+    },
+    {
+      "source": "BKARINVL",
+      "destination": "BKARINVL",
+      "exceptions": {}
+    }
   ]
 }
