@@ -66,28 +66,44 @@ def handle_exceptions(col_name, exceptions):
             return "TIME"
     return None
 
-def create_mysql_table_from_python_metadata(mysql_conn, table_name, columns_metadata, exceptions):
-    """Create a MySQL table based on Python metadata, handling exceptions."""
+def clean_column_name(column_name):
+    """Clean column name to remove invalid characters."""
+    return column_name.strip().replace('#', '')
+
+def create_mysql_table_from_python_metadata(mysql_conn, table_name, columns_metadata, exceptions, primary_key, unique_keys):
+    """Create a MySQL table based on Python metadata, handling exceptions and keys."""
     mysql_cursor = mysql_conn.cursor()
 
     column_definitions = []
     for col_name, col_type, col_length in columns_metadata:
-        exception_type = handle_exceptions(col_name, exceptions)
+        cleaned_col_name = clean_column_name(col_name)  # Clean the column name
+        exception_type = handle_exceptions(cleaned_col_name, exceptions)
         if exception_type:
-            column_definitions.append(f"`{col_name}` {exception_type}")
+            column_definitions.append(f"`{cleaned_col_name}` {exception_type}")
         else:
-            column_definitions.append(f"`{col_name.strip().replace('#', '')}` {map_python_to_mysql_type(col_type, col_length)}")
+            column_definitions.append(f"`{cleaned_col_name}` {map_python_to_mysql_type(col_type, col_length)}")
+
+    # Add primary key if provided
+    if primary_key:
+        primary_key_clause = f"PRIMARY KEY ({', '.join([f'`{clean_column_name(col)}`' for col in primary_key])})"
+        column_definitions.append(primary_key_clause)
+
+    # Add unique keys if provided
+    if unique_keys:
+        unique_key_clause = f"UNIQUE KEY ({', '.join([f'`{clean_column_name(col)}`' for col in unique_keys])})"
+        column_definitions.append(unique_key_clause)
 
     column_definitions.append("`created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
     column_definitions.append("`updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-    
+
     create_table_query = f"""
     CREATE TABLE IF NOT EXISTS `{table_name}` (
         {', '.join(column_definitions)}
-    )"""
+    )
+    """
 
     try:
-        logging.info(f"Creating MySQL table `{table_name}` with exception handling")
+        logging.info(f"Creating MySQL table `{table_name}` with exception handling and primary/unique keys")
         mysql_cursor.execute(create_table_query)
     except mysql.connector.Error as e:
         logging.error(f"Error creating MySQL table {table_name}: {str(e)}")
@@ -121,16 +137,21 @@ def prepare_row_for_mysql(row, exceptions, column_names):
 
     return tuple(prepared_row)
 
-def insert_data_to_mysql(mysql_conn, table_name, columns, rows, batch_size=1000):
-    """Insert data into MySQL table."""
+def insert_data_to_mysql(mysql_conn, table_name, insert_columns, rows, update_columns=None, batch_size=1000):
+    """Insert data into MySQL table, using insert_columns and update_columns from JSON."""
     mysql_cursor = mysql_conn.cursor()
 
-    clean_columns = [col.strip().replace('#', '') for col in columns]
+    # Clean the column names
+    clean_columns = [clean_column_name(col) for col in insert_columns]
 
     column_names = ', '.join([f"`{col}`" for col in clean_columns])
     placeholders = ', '.join(['%s'] * len(clean_columns))
 
-    update_clauses = ', '.join([f"`{col}`=VALUES(`{col}`)" for col in clean_columns])
+    # If no specific update columns are provided, update all insert columns
+    if not update_columns:
+        update_columns = clean_columns
+
+    update_clauses = ', '.join([f"`{clean_column_name(col)}`=VALUES(`{clean_column_name(col)}`)" for col in update_columns])
     
     insert_query = f"""
     INSERT INTO `{table_name}` ({column_names}, `created_at`, `updated_at`)
