@@ -21,26 +21,20 @@ log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 logger = logging.getLogger()
 logger.setLevel(getattr(logging, log_level, logging.INFO))
 
-# File handler (to log into a file)
 file_handler = logging.FileHandler(log_file_path)
 file_handler.setLevel(getattr(logging, log_level, logging.INFO))
 file_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(file_format)
 
-# Console handler (to log to the terminal)
 console_handler = logging.StreamHandler()
 console_handler.setLevel(getattr(logging, log_level, logging.INFO))
 console_format = logging.Formatter('%(levelname)s - %(message)s')
 console_handler.setFormatter(console_format)
 
-# Add both handlers to the logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 logging.info("Script started")
-
-# Initialize table_mappings
-table_mappings = []
 
 # Load table mappings from external JSON file
 try:
@@ -48,7 +42,7 @@ try:
         table_mappings = json.load(f)["table_mappings"]
 except FileNotFoundError as e:
     logging.error(f"FileNotFoundError: {e}")
-    table_mappings = []  # Ensure table_mappings is empty to avoid issues
+    table_mappings = []
 except json.JSONDecodeError as e:
     logging.error(f"JSONDecodeError: Failed to parse 'table_mappings.json' - {e}")
     table_mappings = []
@@ -56,7 +50,7 @@ except Exception as e:
     logging.error(f"An unexpected error occurred: {e}")
     table_mappings = []
 
-# Check if table_mappings is not empty before proceeding
+# Proceed only if table_mappings are valid
 if not table_mappings:
     logging.error("No valid table mappings found. Exiting the script.")
 else:
@@ -67,16 +61,32 @@ else:
 
         # Migrate each table
         for mapping in table_mappings:
-            # Fetch column metadata from ODBC
-            columns_metadata = fetch_odbc_metadata(odbc_conn, mapping["source"])
+            source_table = mapping["source"]
+            destination_table = mapping["destination"]
+            insert_columns = mapping.get("insert_columns", None)
+            update_columns = mapping.get("update_columns", None)
+            primary_key = mapping.get("primary_key", [])
+            unique_keys = mapping.get("unique_keys", [])
+            exceptions = mapping.get("exceptions", {})
 
-            # Create the MySQL table using the fetched metadata, handling exceptions
-            create_mysql_table_from_python_metadata(mysql_conn, mapping["destination"], columns_metadata, mapping.get("exceptions", {}))
+            # Fetch column metadata from ODBC
+            columns_metadata = fetch_odbc_metadata(odbc_conn, source_table)
+
+            # Use columns from metadata if no insert_columns are specified
+            if not insert_columns:
+                insert_columns = [col[0] for col in columns_metadata]
+
+            # If update_columns are not provided, default to insert_columns
+            if not update_columns:
+                update_columns = insert_columns
+
+            # Create the MySQL table using the fetched metadata, handling exceptions and keys
+            create_mysql_table_from_python_metadata(mysql_conn, destination_table, columns_metadata, exceptions, primary_key, unique_keys)
 
             # Migrate data in chunks
-            for chunk in fetch_odbc_data_in_chunks(odbc_conn, mapping["source"]):
-                prepared_rows = [prepare_row_for_mysql(row, mapping.get("exceptions", {}), [col[0] for col in columns_metadata]) for row in chunk]
-                insert_data_to_mysql(mysql_conn, mapping["destination"], [col[0] for col in columns_metadata], prepared_rows)
+            for chunk in fetch_odbc_data_in_chunks(odbc_conn, source_table):
+                prepared_rows = [prepare_row_for_mysql(row, exceptions, insert_columns) for row in chunk]
+                insert_data_to_mysql(mysql_conn, destination_table, insert_columns, prepared_rows, update_columns)
 
     except Exception as e:
         logging.error(f"An error occurred: {str(e)}")

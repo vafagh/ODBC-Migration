@@ -1,15 +1,34 @@
 {
   "table_mappings": [
     {
-      "source": "BKARINV",
-      "destination": "BKARINV",
+      "source": "DBNV",
+      "destination": "DBNV",
+      "insert_columns": [],
+      "update_columns": ["DBINV_NUM","DBINV_INVDTE","DBINV_CUSCOD","DBINV_CUSNME","DBINV_CUSA1","DBINV_CUSCTY","DBINV_CUSZIP",],
+      "primary_key": ["DBINV_SONUM"],
+      "unique_keys": [],
       "exceptions": {
-        "BKAR_INV_JOBCOD": "TIME"
+        "DBINV_JOBCOD": "TIME"
       }
     },
+
     {
-      "source": "BKARINVL",
-      "destination": "BKARINVL",
+      "source": "DBNVL",
+      "destination": "DBNVL",
+      "insert_columns": [],
+      "update_columns": [],
+      "primary_key": ["DBINVL_INVNM", "DBINVL_PCODE", "DBINVL_LINE"],
+      "unique_keys": [],
+      "exceptions": {}
+    },
+
+    {
+      "source": "DBIVL",
+      "destination": "DBNVL",
+      "insert_columns": [],
+      "update_columns": [],
+      "primary_key": [],
+      "unique_keys": [],
       "exceptions": {}
     }
   ]
