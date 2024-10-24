@@ -1,4 +1,4 @@
 
 pyodbc==4.0.30
-mysql-connector-python==8.0.26
+mysql-connector-python==9.1.0
 python-dotenv==1.0.0
