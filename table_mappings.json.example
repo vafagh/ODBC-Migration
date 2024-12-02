@@ -1,34 +1,48 @@
 {
   "table_mappings": [
     {
-      "source": "DBNV",
-      "destination": "DBNV",
+      "source": "ACCINV",
+      "destination": "ACCINV",
       "insert_columns": [],
-      "update_columns": ["DBINV_NUM","DBINV_INVDTE","DBINV_CUSCOD","DBINV_CUSNME","DBINV_CUSA1","DBINV_CUSCTY","DBINV_CUSZIP",],
-      "primary_key": ["DBINV_SONUM"],
+      "update_columns": [ 
+        "ACC_INV_NUM","ACC_INV_INVDTE",
+        "ACC_INV_CUSCOD","ACC_INV_CUSNME","ACC_INV_CUSA1","ACC_INV_CUSCTY","ACC_INV_CUSZIP",
+        "ACC_INV_SHPNME","ACC_INV_SHPA1","ACC_INV_SHPCTY","ACC_INV_SHPZIP","ACC_INV_SHPATN",
+        "ACC_INV_JOBCOD", "ACC_INV_TOTAL", "ACC_INV_TAXAMT","ACC_INV_LOC","ACC_INV_DESC",
+        "ACC_INV_NL","ACC_INV_ENTBY","ACC_INV_SLSP"],
+      "primary_key": ["ACC_INV_SONUM"],
       "unique_keys": [],
+      "trim_trailing_spaces": false,
+      "date_column": [],
+      "days_back": [],
       "exceptions": {
-        "DBINV_JOBCOD": "TIME"
+        "ACC_INV_JOBCOD": "TIME"
       }
     },
 
     {
-      "source": "DBNVL",
-      "destination": "DBNVL",
+      "source": "ACCINVL",
+      "destination": "invoiceLine",
       "insert_columns": [],
       "update_columns": [],
-      "primary_key": ["DBINVL_INVNM", "DBINVL_PCODE", "DBINVL_LINE"],
+      "primary_key": ["ACC_INVL_INVNM", "ACC_INVL_PCODE", "ACC_INVL_LINE"],
       "unique_keys": [],
+      "trim_trailing_spaces": false,
+      "date_column": [],
+      "days_back": "",
       "exceptions": {}
     },
 
     {
-      "source": "DBIVL",
-      "destination": "DBNVL",
+      "source": "ACCCUST",
+      "destination": "customers",
       "insert_columns": [],
       "update_columns": [],
       "primary_key": [],
       "unique_keys": [],
+      "trim_trailing_spaces": fasle,
+      "date_column": "ACC_INV_INVDTE",  // Column to filter on
+      "days_back": "35",  // Only process records greater than this date
       "exceptions": {}
     }
   ]

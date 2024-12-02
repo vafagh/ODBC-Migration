@@ -1,7 +1,18 @@
+import os
 import pyodbc
-import mysql.connector
 import logging
-from datetime import date, datetime
+import mysql.connector
+from datetime import datetime, timedelta, date
+from mysql.connector import Error as MySQLError
+
+def close_connections(*connections):
+    for conn in connections:
+        if conn:
+            conn.close()
+    logging.info("Connections closed")
+
+def clean_column_name(column_name):
+    return column_name.strip().replace('#', '_')
 
 def connect_odbc(dsn):
     """Establish a readonly connection to the ODBC source."""
@@ -9,170 +20,412 @@ def connect_odbc(dsn):
         logging.info(f"Connecting to ODBC source using DSN: {dsn} (readonly)")
         return pyodbc.connect(f"DSN={dsn};READONLY=YES")
     except pyodbc.Error as e:
-        logging.error(f"Error connecting to ODBC: {str(e)}")
+        logging.error(f"Error connecting to ODBC: {str(e)}", exc_info=True)
         raise
 
 def connect_mysql(host, user, password, database):
-    """Establish a connection to the MySQL database."""
+    """
+    Connect to the MySQL database.
+    
+    Parameters:
+        host (str): The MySQL server host.
+        user (str): The MySQL username.
+        password (str): The MySQL password.
+        database (str): The database name to connect to.
+
+    Returns:
+        mysql.connector.connection_cext.CMySQLConnection: A connection object to interact with MySQL.
+    """
     try:
-        logging.info(f"Connecting to MySQL database at {host}")
-        return mysql.connector.connect(
+        connection = mysql.connector.connect(
             host=host,
             user=user,
             password=password,
             database=database
         )
-    except mysql.connector.Error as e:
-        logging.error(f"Error connecting to MySQL: {str(e)}")
+        logging.info(f"Connected to MySQL database at {host}")
+        return connection
+    except mysql.connector.Error as err:
+        logging.error(f"Error connecting to MySQL: {err}", exc_info=True)
         raise
 
-def fetch_odbc_metadata(odbc_conn, table_name):
-    """Fetch metadata (column names, types, lengths) from ODBC table."""
-    try:
-        cursor = odbc_conn.cursor()
-        cursor.execute(f"SELECT * FROM {table_name} WHERE 1=0")  # No data, just schema
-
-        columns_metadata = []
-        for column in cursor.description:
-            col_name = column[0]
-            col_type = column[1]  # Get actual type from ODBC metadata
-            col_length = column[3]  # Column length
-
-            # logging.info(f"Column: {col_name}, Type: {col_type}, Length: {col_length}")
-
-            columns_metadata.append((col_name, col_type, col_length))
-
-        return columns_metadata
-    except pyodbc.Error as e:
-        logging.error(f"Error fetching metadata from ODBC table {table_name}: {str(e)}")
-        raise
-
-def map_python_to_mysql_type(python_type, length=None):
-    """Map Python data types (from ODBC) to MySQL data types, considering length."""
-    python_to_mysql = {
-        int: 'INT',
-        float: 'FLOAT',
-        str: f'VARCHAR({length or 255})',  # Use length if available, else default to 255
-        bool: 'TINYINT(1)',
-        date: 'DATE',
-        datetime: 'DATETIME',
+def create_mysql_table_from_odbc_metadata(mysql_conn, destination_table, columns, primary_key, unique_keys, exceptions):
+    """
+    Create a MySQL table based on ODBC metadata and mapping exceptions.
+    """
+    type_mapping = {
+        "TEXT": "TEXT",
+        "STRING": "VARCHAR(255)",
+        "DATE": "DATE",
+        "TIME": "TIME",
+        "INT": "INT",
+        "FLOAT": "FLOAT",
+        "DECIMAL": "DECIMAL(10,2)",
+        "BOOLEAN": "TINYINT(1)"
     }
-    return python_to_mysql.get(python_type, f'VARCHAR({length or 255})')
 
-def handle_exceptions(col_name, exceptions):
-    """Check if the column is in the exceptions list and handle its type."""
-    if col_name in exceptions:
-        if exceptions[col_name] == "TIME":
-            return "TIME"
-    return None
+    # Log the ODBC metadata for the table
+    logging.debug(f"ODBC metadata for table `{destination_table}`: {columns}")
+    logging.info(f"ODBC metadata for table `{destination_table}`")
 
-def clean_column_name(column_name):
-    """Clean column name to remove invalid characters."""
-    return column_name.strip().replace('#', '')
-
-def create_mysql_table_from_python_metadata(mysql_conn, table_name, columns_metadata, exceptions, primary_key, unique_keys):
-    """Create a MySQL table based on Python metadata, handling exceptions and keys."""
-    mysql_cursor = mysql_conn.cursor()
+    cursor = mysql_conn.cursor()
 
     column_definitions = []
-    for col_name, col_type, col_length in columns_metadata:
-        cleaned_col_name = clean_column_name(col_name)  # Clean the column name
-        exception_type = handle_exceptions(cleaned_col_name, exceptions)
-        if exception_type:
-            column_definitions.append(f"`{cleaned_col_name}` {exception_type}")
+    for col in columns:
+        col_name = col[0]
+        odbc_type = col[1]
+        
+        # Apply exceptions first
+        if exceptions and col_name in exceptions:
+            exception = exceptions[col_name]
+            col_type = type_mapping.get(exception.get("type"), "TEXT")
+            if exception.get("type") == "DECIMAL":
+                precision = exception.get("precision", "10,2")
+                col_type = f"DECIMAL({precision})"
+            if exception.get("type") == "STRING":
+                max_length = exception.get("max_length", 255)
+                col_type = f"VARCHAR({max_length})"
         else:
-            column_definitions.append(f"`{cleaned_col_name}` {map_python_to_mysql_type(col_type, col_length)}")
+            # Map ODBC type to MySQL type
+            col_type = type_mapping.get(odbc_type.upper(), "TEXT")
 
-    # Add primary key if provided
+        # Add key length for TEXT columns in primary/unique keys
+        if col_name in primary_key or col_name in unique_keys:
+            if col_type.startswith("TEXT"):
+                key_length = exceptions.get(col_name, {}).get("key_length", 100)
+                col_type = f"VARCHAR({key_length})"
+
+        column_definitions.append(f"`{col_name}` {col_type}")
+
+    # Log the prepared MySQL column definitions
+    logging.debug(f"MySQL column definitions for table `{destination_table}`: {column_definitions}")
+
+    # Add primary and unique keys
     if primary_key:
-        primary_key_clause = f"PRIMARY KEY ({', '.join([f'`{clean_column_name(col)}`' for col in primary_key])})"
-        column_definitions.append(primary_key_clause)
+        primary_key_str = ", ".join([f"`{pk}`" for pk in primary_key])
+        column_definitions.append(f"PRIMARY KEY ({primary_key_str})")
 
-    # Add unique keys if provided
     if unique_keys:
-        unique_key_clause = f"UNIQUE KEY ({', '.join([f'`{clean_column_name(col)}`' for col in unique_keys])})"
-        column_definitions.append(unique_key_clause)
+        unique_key_str = ", ".join([f"`{uk}`" for uk in unique_keys])
+        column_definitions.append(f"UNIQUE KEY ({unique_key_str})")
 
-    column_definitions.append("`created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
-    column_definitions.append("`updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-
-    create_table_query = f"""
-    CREATE TABLE IF NOT EXISTS `{table_name}` (
-        {', '.join(column_definitions)}
-    )
-    """
+    # Create the table
+    create_query = f"CREATE TABLE IF NOT EXISTS `{destination_table}` (\n  {', '.join(column_definitions)}\n)"
+    logging.debug(f"Creating MySQL table `{destination_table}` with query: {create_query}")
+    logging.info(f"Creating MySQL table `{destination_table}`")
 
     try:
-        logging.info(f"Creating MySQL table `{table_name}` with exception handling and primary/unique keys")
-        mysql_cursor.execute(create_table_query)
-    except mysql.connector.Error as e:
-        logging.error(f"Error creating MySQL table {table_name}: {str(e)}")
-        raise
+        cursor.execute(create_query)
+        mysql_conn.commit()
+        logging.info(f"MySQL table `{destination_table}` created successfully.")
+    except Exception as e:
+        logging.error(f"Error creating MySQL table `{destination_table}`: {e}", exc_info=True)
+    finally:
+        cursor.close()
 
-def fetch_odbc_data_in_chunks(odbc_conn, table_name, chunk_size=1000):
-    """Fetch ODBC data in chunks to handle large datasets efficiently."""
-    cursor = odbc_conn.cursor()
-    cursor.execute(f"SELECT * FROM {table_name}")
-    
-    while True:
-        chunk = cursor.fetchmany(chunk_size)
-        if not chunk:
-            break
-        yield chunk
-
-def prepare_row_for_mysql(row, exceptions, column_names):
-    """Prepare a row for MySQL insertion, handling exceptions like time formatting."""
-    prepared_row = []
-    for idx, value in enumerate(row):
-        col_name = column_names[idx]
-
-        if col_name in exceptions and exceptions[col_name] == "TIME" and isinstance(value, str):
-            try:
-                time_value = datetime.strptime(value.strip(), '%I:%M %p').time()
-                prepared_row.append(time_value.strftime('%H:%M:%S'))
-            except ValueError:
-                prepared_row.append('00:00:00')
-        else:
-            prepared_row.append(None if value is None else str(value).strip())
-
-    return tuple(prepared_row)
-
-def insert_data_to_mysql(mysql_conn, table_name, insert_columns, rows, update_columns=None, batch_size=1000):
-    """Insert data into MySQL table, using insert_columns and update_columns from JSON."""
+def does_table_exist(mysql_conn, table_name):
+    """Check if a table exists in the MySQL database."""
     mysql_cursor = mysql_conn.cursor()
+    try:
+        mysql_cursor.execute(f"SHOW TABLES LIKE '{table_name}'")
+        result = mysql_cursor.fetchone()
+        return result is not None
+    except MySQLError as e:
+        logging.error(f"Error checking existence of table {table_name}: {str(e)}", exc_info=True)
+        return False
 
-    # Clean the column names
-    clean_columns = [clean_column_name(col) for col in insert_columns]
-
-    column_names = ', '.join([f"`{col}`" for col in clean_columns])
-    placeholders = ', '.join(['%s'] * len(clean_columns))
-
-    # If no specific update columns are provided, update all insert columns
-    if not update_columns:
-        update_columns = clean_columns
-
-    update_clauses = ', '.join([f"`{clean_column_name(col)}`=VALUES(`{clean_column_name(col)}`)" for col in update_columns])
+def drop_mysql_table_if_exists(mysql_conn, table_name):
+    """
+    Drop a MySQL table if it exists.
     
-    insert_query = f"""
-    INSERT INTO `{table_name}` ({column_names}, `created_at`, `updated_at`)
-    VALUES ({placeholders}, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-    ON DUPLICATE KEY UPDATE {update_clauses}, `updated_at`=CURRENT_TIMESTAMP
+    Parameters:
+        mysql_conn: MySQL connection object.
+        table_name (str): The name of the table to drop.
+    
+    Returns:
+        None
+    """
+    try:
+        cursor = mysql_conn.cursor()
+        query = f"DROP TABLE IF EXISTS `{table_name}`"
+        cursor.execute(query)
+        mysql_conn.commit()
+        logging.info(f"Table `{table_name}` dropped successfully (if it existed).")
+    except Exception as e:
+        logging.error(f"Error dropping table `{table_name}`: {str(e)}", exc_info=True)
+        raise
+    finally:
+        cursor.close()
+
+def fetch_and_insert_rows(
+    chunk_size,
+    odbc_conn, mysql_conn, source_table, destination_table, columns, primary_key, unique_keys,
+    sort_column, exceptions=None, since=None, trim_trailing_spaces=False, insert_columns=None
+):
+    cursor = odbc_conn.cursor()
+
+    normalized_columns = [col[0].strip().upper() for col in columns]
+    normalized_primary_keys = [pk.strip().upper() for pk in primary_key]
+
+    if since and sort_column:
+        look_back_date = (datetime.now() - timedelta(days=since)).strftime('%Y-%m-%d')
+        date_filter = f"{sort_column} > '{look_back_date}'"
+    else:
+        date_filter = None
+
+    where_clause = f"WHERE {date_filter}" if date_filter else ""
+    query = f"""
+        SELECT * FROM {source_table}
+        {where_clause}
+        ORDER BY {sort_column}
+    """
+
+    logging.debug(f"Executing query: {query}")
+    batch_number = 1
+
+    try:
+        cursor.execute(query)
+        while True:
+            try:
+                chunk = cursor.fetchmany(chunk_size)
+            except pyodbc.DataError as e:
+                logging.error(f"DataError while fetching rows from {source_table}: {str(e)}")
+                continue  # Skip invalid row
+
+            if not chunk:
+                logging.info(f"No more rows to process for table {source_table}.")
+                break
+
+            converted_chunk = []
+            for row in chunk:
+                try:
+                    processed_row = process_row(row, columns, exceptions, trim_trailing_spaces)
+                    converted_chunk.append(processed_row)
+                except Exception as e:
+                    logging.warning(f"Error processing row {row}: {str(e)}")
+                    continue  # Skip invalid row
+
+            logging.info(f"Inserting batch {batch_number} into `{destination_table}`.")
+            insert_data_to_mysql(
+                mysql_conn,
+                destination_table,
+                columns,
+                converted_chunk,
+                primary_key,
+                batch_size=chunk_size,
+                exceptions=exceptions
+            )
+            batch_number += 1
+
+    except pyodbc.Error as e:
+        logging.error(f"Error fetching data from ODBC table {source_table}: {str(e)}", exc_info=True)
+
+def fetch_and_update_rows(
+    odbc_conn, mysql_conn, source_table, destination_table, columns, primary_key, unique_keys,
+    sort_column, update_columns, exceptions=None, chunk_size=1000, trim_trailing_spaces=False
+):
+    """
+    Fetch rows from ODBC and update them in the MySQL table.
+    """
+    cursor = odbc_conn.cursor()
+    update_query = f"""
+        INSERT INTO `{destination_table}` ({', '.join([f"`{col[0]}`" for col in columns])})
+        VALUES ({', '.join(['%s'] * len(columns))})
+        ON DUPLICATE KEY UPDATE
+        {', '.join([f"`{col}`=VALUES(`{col}`)" for col in update_columns])}
+    """
+
+    query = f"SELECT * FROM {source_table} ORDER BY {sort_column}"
+    logging.info(f"Executing query: {query}")
+
+    try:
+        cursor.execute(query)
+        while True:
+            chunk = cursor.fetchmany(chunk_size)
+            if not chunk:
+                logging.info(f"No more rows to process for table {source_table}.")
+                break
+
+            converted_chunk = [
+                process_row(row, columns, exceptions, trim_trailing_spaces) for row in chunk
+            ]
+
+            # Execute the update query
+            cursor = mysql_conn.cursor()
+            cursor.executemany(update_query, converted_chunk)
+            mysql_conn.commit()
+            logging.info(f"Batch of {len(converted_chunk)} rows updated in `{destination_table}`.")
+
+    except Exception as e:
+        logging.error(f"Error updating rows in table {destination_table}: {str(e)}", exc_info=True)
+
+def fetch_odbc_metadata(odbc_conn, source_table, exceptions=None):
+    """
+    Fetch metadata (columns and types) for a table from the ODBC source.
+    """
+    try:
+        cursor = odbc_conn.cursor()
+        query = f"SELECT * FROM {source_table} WHERE 1=0"  # Fetch only metadata
+        cursor.execute(query)
+        metadata = cursor.description
+        cursor.close()
+
+        columns_metadata = []
+        for column in metadata:
+            column_name = column[0]
+            column_type = column[1].__name__  # Assuming the type is a Python type
+            if exceptions and column_name in exceptions:
+                column_type = exceptions[column_name].get("type", column_type)
+            columns_metadata.append((column_name, column_type))
+
+        return columns_metadata
+    except Exception as e:
+        logging.error(f"Failed to fetch metadata for table {source_table}: {str(e)}")
+        raise
+
+def insert_data_to_mysql(mysql_conn,destination_table,columns,chunk,primary_key,batch_size,exceptions=None,trim_trailing_spaces=False):
+    """
+    Insert processed rows into a MySQL table.
+    """
+    cursor = mysql_conn.cursor()
+    column_names = ', '.join([f"`{col[0]}`" for col in columns])
+    placeholders = ', '.join(['%s'] * len(columns))
+    insert_query = f"INSERT INTO `{destination_table}` ({column_names}) VALUES ({placeholders})"
+
+    # Handle ON DUPLICATE KEY UPDATE for primary/unique keys
+    if primary_key:
+        update_columns = ', '.join([f"`{col}`=VALUES(`{col}`)" for col in primary_key])
+        insert_query += f" ON DUPLICATE KEY UPDATE {update_columns}"
+
+    logging.info(f"Preparing to insert {len(chunk)} rows into `{destination_table}`.")
+
+    processed_chunk = []
+    for row in chunk:
+        try:
+            processed_row = process_row(row, columns, exceptions, trim_trailing_spaces)
+            processed_chunk.append(processed_row)
+        except Exception as e:
+            logging.error(f"Error processing row: {row} - {str(e)}")
+
+    try:
+        cursor.executemany(insert_query, processed_chunk)
+        mysql_conn.commit()
+        logging.info(f"Batch of {len(processed_chunk)} rows committed to `{destination_table}`.")
+    except Exception as e:
+        logging.error(f"Error inserting batch into `{destination_table}`: {str(e)}", exc_info=True)
+
+def migrate_table_with_difference(chunk_size,
+    mysql_conn, odbc_conn, source_table, destination_table, primary_key, unique_keys,
+    update_columns, sort_column, exceptions, trim_trailing_spaces, insert_columns
+):
+    """
+    Migrate a single table from ODBC to MySQL, handling differences in data.
     """
 
     try:
-        logging.info(f"Inserting data into MySQL table {table_name} in batches")
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i:i + batch_size]
-            mysql_cursor.executemany(insert_query, batch)
-            mysql_conn.commit()
-            logging.info(f"Batch {i//batch_size + 1} committed for table {table_name}")
-    except mysql.connector.Error as e:
-        logging.error(f"Error inserting data into MySQL table {table_name}: {str(e)}")
-        raise
+        # Fetch ODBC metadata
+        logging.info(f"Fetching ODBC metadata for table: {source_table}")
+        columns_metadata = fetch_odbc_metadata(odbc_conn, source_table, exceptions)
+        # logging.info(f"Fetched metadata for table `{source_table}`: {columns_metadata}")
+        
+        # Create MySQL table if it doesn't exist
+        create_mysql_table_from_odbc_metadata(
+            mysql_conn,
+            destination_table,
+            columns_metadata,
+            primary_key,
+            unique_keys,
+            exceptions
+        )
+        
+        # Fetch and insert rows
+        fetch_and_insert_rows(
+            odbc_conn=odbc_conn,
+            mysql_conn=mysql_conn,
+            source_table=source_table,
+            destination_table=destination_table,
+            columns=columns_metadata,
+            primary_key=primary_key,
+            unique_keys=unique_keys,
+            sort_column=sort_column,
+            exceptions=exceptions,
+            insert_columns=insert_columns,
+            trim_trailing_spaces=trim_trailing_spaces,
+            chunk_size=chunk_size
+        )
+    except Exception as e:
+        logging.error(f"Failed to migrate table `{source_table}` to `{destination_table}`: {e}", exc_info=True)
 
-def close_connections(*connections):
-    """Safely close multiple database connections."""
-    for conn in connections:
-        if conn:
-            conn.close()
-    logging.info("Connections closed")
+def process_row(row, columns, exceptions, trim_trailing_spaces):
+    """
+    Process a single row by applying exceptions, validating and formatting dates/times, and trimming values.
+    """
+    processed_row = []
+    for idx, col in enumerate(columns):
+        col_name = col[0]
+        value = row[idx]
+
+        try:
+            # Handle exceptions for specific column types
+            if exceptions and col_name in exceptions:
+                exception = exceptions[col_name]
+
+                if exception.get("type") == "TIME":
+                    time_format = exception.get("format", "%I:%M %p")
+                    if value is None or (isinstance(value, str) and not value.strip()):
+                        value = None
+                    elif isinstance(value, str):
+                        try:
+                            # Normalize the input
+                            value = value.strip().upper()
+                            if not value.endswith("AM") and not value.endswith("PM"):
+                                value = value.replace("P", "PM").replace("A", "AM")
+                            
+                            value = datetime.strptime(value, time_format).strftime('%H:%M:%S')
+                        except ValueError:
+                            # Handle valid 24-hour time format
+                            try:
+                                value = datetime.strptime(value.strip(), "%H:%M:%S").strftime('%H:%M:%S')
+                            except ValueError:
+                                logging.warning(f"Unrecognized TIME value for column {col_name}: {value}")
+                                value = None
+                    elif isinstance(value, datetime):
+                        value = value.strftime('%H:%M:%S')
+                    else:
+                        logging.warning(f"Unexpected TIME value for column {col_name}: {value} (type: {type(value)})")
+                        value = None
+
+                # Updated DATE logic
+                if exception.get("type") == "DATE":
+                    try:
+                        if value is None or (isinstance(value, str) and not value.strip()):
+                            value = None
+                        elif isinstance(value, str):
+                            try:
+                                # Try parsing as standard MySQL date
+                                value = datetime.strptime(value.strip(), "%Y-%m-%d").date()
+                            except ValueError:
+                                # Fallback to parsing as mm/dd/yyyy
+                                value = datetime.strptime(value.strip(), "%m/%d/%Y").date()
+                        elif isinstance(value, (datetime, date)):
+                            # Convert datetime or date to MySQL-compatible format
+                            value = value.date()
+                        else:
+                            logging.warning(f"Unexpected DATE value for column {col_name}: {value} (type: {type(value)})")
+                            value = None
+                    except Exception as e:
+                        logging.error(f"Unexpected error while processing DATE for column {col_name}: {value} - {str(e)}")
+                        value = None
+
+
+            # General trimming for text values
+            if trim_trailing_spaces and isinstance(value, str):
+                value = value.strip()
+
+        except Exception as e:
+            logging.error(f"Unexpected error while processing column {col_name}: {value} - {str(e)}")
+            value = None
+
+        processed_row.append(value)
+
+    return tuple(processed_row)
