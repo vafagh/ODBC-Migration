@@ -1,6 +1,7 @@
 {
   "table_mappings": [
     {
+      "active": true,
       "source": "ACCINV",
       "destination": "ACCINV",
       "insert_columns": [],
@@ -21,6 +22,7 @@
     },
 
     {
+      "active": true,
       "source": "ACCINVL",
       "destination": "invoiceLine",
       "insert_columns": [],
@@ -34,6 +36,7 @@
     },
 
     {
+      "active": false,
       "source": "ACCCUST",
       "destination": "customers",
       "insert_columns": [],
@@ -43,7 +46,10 @@
       "trim_trailing_spaces": fasle,
       "date_column": "ACC_INV_INVDTE",  // Column to filter on
       "days_back": "35",  // Only process records greater than this date
-      "exceptions": {}
+      "exceptions": {
+        "ACC_CUST_NM":{"type":"INT"},
+        "ACC_CUST_CODE":{"type":"VARCHAR","length":25}
+      }
     }
   ]
 }

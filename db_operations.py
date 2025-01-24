@@ -55,7 +55,7 @@ def create_mysql_table_from_odbc_metadata(mysql_conn, destination_table, columns
     """
     type_mapping = {
         "TEXT": "TEXT",
-        "STRING": "VARCHAR(255)",
+        "STRING": "VARCHAR(255)",  # Map STRING to VARCHAR by default
         "DATE": "DATE",
         "TIME": "TIME",
         "INT": "INT",
@@ -64,41 +64,47 @@ def create_mysql_table_from_odbc_metadata(mysql_conn, destination_table, columns
         "BOOLEAN": "TINYINT(1)"
     }
 
-    # Log the ODBC metadata for the table
     logging.debug(f"ODBC metadata for table `{destination_table}`: {columns}")
-    logging.info(f"ODBC metadata for table `{destination_table}`")
-
     cursor = mysql_conn.cursor()
 
     column_definitions = []
     for col in columns:
         col_name = col[0]
         odbc_type = col[1]
-        
-        # Apply exceptions first
+        custom_type = None
+        length = None
+
+        # Apply exceptions if provided
         if exceptions and col_name in exceptions:
             exception = exceptions[col_name]
-            col_type = type_mapping.get(exception.get("type"), "TEXT")
-            if exception.get("type") == "DECIMAL":
-                precision = exception.get("precision", "10,2")
-                col_type = f"DECIMAL({precision})"
-            if exception.get("type") == "STRING":
-                max_length = exception.get("max_length", 255)
-                col_type = f"VARCHAR({max_length})"
+            custom_type = exception.get("type", "").upper()
+            length = exception.get("length")
+
+            # Handle custom types and validate
+            if custom_type in type_mapping:
+                col_type = type_mapping[custom_type]
+                if custom_type.startswith("VARCHAR") and length:
+                    col_type = f"VARCHAR({length})"
+            elif custom_type == "VARCHAR":
+                col_type = f"VARCHAR({length or 255})"  # Default to VARCHAR(255) if length isn't provided
+            else:
+                raise ValueError(f"Invalid MySQL type '{custom_type}' for column '{col_name}' in exceptions.")
         else:
             # Map ODBC type to MySQL type
             col_type = type_mapping.get(odbc_type.upper(), "TEXT")
 
-        # Add key length for TEXT columns in primary/unique keys
+        # Handle primary/unique key length for TEXT columns
         if col_name in primary_key or col_name in unique_keys:
             if col_type.startswith("TEXT"):
                 key_length = exceptions.get(col_name, {}).get("key_length", 100)
                 col_type = f"VARCHAR({key_length})"
 
         column_definitions.append(f"`{col_name}` {col_type}")
+        
+    # Add `created_at` and `updated_at` columns
+    column_definitions.append("`created_at` DATETIME DEFAULT CURRENT_TIMESTAMP")
+    column_definitions.append("`updated_at` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
 
-    # Log the prepared MySQL column definitions
-    logging.debug(f"MySQL column definitions for table `{destination_table}`: {column_definitions}")
 
     # Add primary and unique keys
     if primary_key:
@@ -162,6 +168,9 @@ def fetch_and_insert_rows(
     odbc_conn, mysql_conn, source_table, destination_table, columns, primary_key, unique_keys,
     sort_column, exceptions=None, since=None, trim_trailing_spaces=False, insert_columns=None
 ):
+    """
+    Fetch ODBC data starting from an offset and insert it into MySQL with `created_at` and `updated_at`.
+    """
     cursor = odbc_conn.cursor()
 
     normalized_columns = [col[0].strip().upper() for col in columns]
@@ -183,6 +192,10 @@ def fetch_and_insert_rows(
     logging.debug(f"Executing query: {query}")
     batch_number = 1
 
+    # Add `created_at` and `updated_at` columns for insertion only
+    additional_columns = [("created_at", "DATETIME"), ("updated_at", "DATETIME")]
+    insert_columns = columns + additional_columns
+
     try:
         cursor.execute(query)
         while True:
@@ -199,8 +212,16 @@ def fetch_and_insert_rows(
             converted_chunk = []
             for row in chunk:
                 try:
+                    # Process the row based on original columns
                     processed_row = process_row(row, columns, exceptions, trim_trailing_spaces)
-                    converted_chunk.append(processed_row)
+
+                    # Append `created_at` and `updated_at` timestamps for insertion
+                    now = datetime.now()
+                    processed_row = list(processed_row)
+                    processed_row.append(now)  # created_at
+                    processed_row.append(now)  # updated_at
+
+                    converted_chunk.append(tuple(processed_row))
                 except Exception as e:
                     logging.warning(f"Error processing row {row}: {str(e)}")
                     continue  # Skip invalid row
@@ -209,7 +230,7 @@ def fetch_and_insert_rows(
             insert_data_to_mysql(
                 mysql_conn,
                 destination_table,
-                columns,
+                insert_columns,  # Use updated columns list with timestamps
                 converted_chunk,
                 primary_key,
                 batch_size=chunk_size,
@@ -222,42 +243,92 @@ def fetch_and_insert_rows(
 
 def fetch_and_update_rows(
     odbc_conn, mysql_conn, source_table, destination_table, columns, primary_key, unique_keys,
-    sort_column, update_columns, exceptions=None, chunk_size=1000, trim_trailing_spaces=False
+    sort_column, update_columns, chunk_size, exceptions=None, trim_trailing_spaces=False, since=None
 ):
     """
-    Fetch rows from ODBC and update them in the MySQL table.
+    Fetch rows from ODBC and update them in the MySQL table with error handling for bad records.
     """
     cursor = odbc_conn.cursor()
-    update_query = f"""
-        INSERT INTO `{destination_table}` ({', '.join([f"`{col[0]}`" for col in columns])})
-        VALUES ({', '.join(['%s'] * len(columns))})
-        ON DUPLICATE KEY UPDATE
-        {', '.join([f"`{col}`=VALUES(`{col}`)" for col in update_columns])}
-    """
 
-    query = f"SELECT * FROM {source_table} ORDER BY {sort_column}"
+    # Add `created_at` and `updated_at` columns dynamically for updates
+    additional_columns = [("created_at", "DATETIME"), ("updated_at", "DATETIME")]
+    final_columns = columns + additional_columns
+
+    # Prepare the base query
+    base_query = f"SELECT * FROM {source_table}"
+
+    # Apply `since` filter if provided
+    date_filter = None
+    if since and sort_column:
+        look_back_date = (datetime.now() - timedelta(days=since)).strftime('%Y-%m-%d')
+        date_filter = f"{sort_column} IS NOT NULL AND {sort_column} > '{look_back_date}'"
+    else:
+        date_filter = f"{sort_column} IS NOT NULL"  # Ignore rows with NULL sort_column
+
+    # Finalize the query with filters and sorting
+    where_clause = f"WHERE {date_filter}" if date_filter else ""
+    query = f"{base_query} {where_clause} ORDER BY {sort_column}"
     logging.info(f"Executing query: {query}")
+
+    # Prepare the update query for MySQL
+    update_query = f"""
+        INSERT INTO `{destination_table}` ({', '.join([f"`{col[0]}`" for col in final_columns])})
+        VALUES ({', '.join(['%s'] * len(final_columns))})
+        ON DUPLICATE KEY UPDATE
+        {', '.join([f"`{col}`=VALUES(`{col}`)" for col in update_columns])},
+        `updated_at`=VALUES(`updated_at`)
+    """
 
     try:
         cursor.execute(query)
         while True:
-            chunk = cursor.fetchmany(chunk_size)
-            if not chunk:
-                logging.info(f"No more rows to process for table {source_table}.")
-                break
+            try:
+                chunk = cursor.fetchmany(chunk_size)
+                if not chunk:
+                    logging.info(f"No more rows to process for table {source_table}.")
+                    break
+            except pyodbc.DataError as e:
+                logging.error(f"DataError while fetching rows from {source_table}: {str(e)}")
+                continue  # Skip the problematic batch
 
-            converted_chunk = [
-                process_row(row, columns, exceptions, trim_trailing_spaces) for row in chunk
-            ]
+            converted_chunk = []
+            bad_records = []  # Collect bad rows in this batch
 
-            # Execute the update query
-            cursor = mysql_conn.cursor()
-            cursor.executemany(update_query, converted_chunk)
-            mysql_conn.commit()
-            logging.info(f"Batch of {len(converted_chunk)} rows updated in `{destination_table}`.")
+            for row in chunk:
+                try:
+                    # Process the row based on the original ODBC columns
+                    processed_row = process_row(row, columns, exceptions, trim_trailing_spaces)
+
+                    # Append `created_at` and `updated_at` timestamps for insertion
+                    now = datetime.now()
+                    processed_row = list(processed_row)
+                    processed_row.append(now)  # created_at
+                    processed_row.append(now)  # updated_at
+
+                    converted_chunk.append(tuple(processed_row))
+                except Exception as e:
+                    logging.warning(f"Error processing row {row}: {str(e)}")
+                    bad_records.append(row)  # Log the bad record for debugging
+
+            # Log bad records to a file
+            if bad_records:
+                bad_log_file = f"bad_records_{destination_table}.log"
+                with open(bad_log_file, "a") as f:
+                    for bad_row in bad_records:
+                        f.write(f"{bad_row}\n")
+                logging.warning(f"{len(bad_records)} bad rows logged to {bad_log_file}")
+
+            # Execute the update query for valid rows
+            try:
+                mysql_cursor = mysql_conn.cursor()
+                mysql_cursor.executemany(update_query, converted_chunk)
+                mysql_conn.commit()
+                logging.info(f"Batch of {len(converted_chunk)} rows updated in `{destination_table}`.")
+            except Exception as e:
+                logging.error(f"Error updating batch in table {destination_table}: {str(e)}", exc_info=True)
 
     except Exception as e:
-        logging.error(f"Error updating rows in table {destination_table}: {str(e)}", exc_info=True)
+        logging.error(f"Error fetching data from ODBC table {source_table}: {str(e)}", exc_info=True)
 
 def fetch_odbc_metadata(odbc_conn, source_table, exceptions=None):
     """
