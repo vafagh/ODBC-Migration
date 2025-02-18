@@ -164,25 +164,27 @@ def drop_mysql_table_if_exists(mysql_conn, table_name):
         cursor.close()
 
 def fetch_and_insert_rows(
-    chunk_size,
-    odbc_conn, mysql_conn, source_table, destination_table, columns, primary_key, unique_keys,
-    sort_column, exceptions=None, since=None, trim_trailing_spaces=False, insert_columns=None
+    chunk_size, odbc_conn, mysql_conn, source_table, destination_table, columns,
+    primary_key, unique_keys, sort_column, insert_only_new_rows=False, latest_sort_value=None,
+    exceptions=None, trim_trailing_spaces=False, insert_columns=None, since=None
 ):
     """
-    Fetch ODBC data starting from an offset and insert it into MySQL with `created_at` and `updated_at`.
+    Fetch ODBC data and insert it into MySQL. Uses `since` or `latest_sort_value` when applicable.
     """
     cursor = odbc_conn.cursor()
 
-    normalized_columns = [col[0].strip().upper() for col in columns]
-    normalized_primary_keys = [pk.strip().upper() for pk in primary_key]
-
-    if since and sort_column:
+    # Apply `since` or `InsertOnlyNewRows`
+    where_conditions = []
+    if since and not insert_only_new_rows:
         look_back_date = (datetime.now() - timedelta(days=since)).strftime('%Y-%m-%d')
-        date_filter = f"{sort_column} > '{look_back_date}'"
-    else:
-        date_filter = None
+        where_conditions.append(f"{sort_column} IS NOT NULL AND {sort_column} > '{look_back_date}'")
 
-    where_clause = f"WHERE {date_filter}" if date_filter else ""
+    if insert_only_new_rows and latest_sort_value:
+        where_conditions.append(f"{sort_column} > '{latest_sort_value}'")
+
+    where_clause = f"WHERE {' AND '.join(where_conditions)}" if where_conditions else ""
+
+    # Construct the query with proper ORDER BY (remove backticks for ODBC)
     query = f"""
         SELECT * FROM {source_table}
         {where_clause}
@@ -192,27 +194,25 @@ def fetch_and_insert_rows(
     logging.debug(f"Executing query: {query}")
     batch_number = 1
 
-    # Add `created_at` and `updated_at` columns for insertion only
+    # Add `created_at` and `updated_at` columns for insertion
     additional_columns = [("created_at", "DATETIME"), ("updated_at", "DATETIME")]
-    insert_columns = columns + additional_columns
+    final_columns = columns + additional_columns
 
     try:
         cursor.execute(query)
         while True:
             try:
                 chunk = cursor.fetchmany(chunk_size)
+                if not chunk:
+                    logging.info(f"No more rows to process for table {source_table}.")
+                    break
             except pyodbc.DataError as e:
                 logging.error(f"DataError while fetching rows from {source_table}: {str(e)}")
                 continue  # Skip invalid row
 
-            if not chunk:
-                logging.info(f"No more rows to process for table {source_table}.")
-                break
-
             converted_chunk = []
             for row in chunk:
                 try:
-                    # Process the row based on original columns
                     processed_row = process_row(row, columns, exceptions, trim_trailing_spaces)
 
                     # Append `created_at` and `updated_at` timestamps for insertion
@@ -230,7 +230,7 @@ def fetch_and_insert_rows(
             insert_data_to_mysql(
                 mysql_conn,
                 destination_table,
-                insert_columns,  # Use updated columns list with timestamps
+                final_columns,  # Use updated columns list with timestamps
                 converted_chunk,
                 primary_key,
                 batch_size=chunk_size,
@@ -250,33 +250,34 @@ def fetch_and_update_rows(
     """
     cursor = odbc_conn.cursor()
 
-    # Add `created_at` and `updated_at` columns dynamically for updates
-    additional_columns = [("created_at", "DATETIME"), ("updated_at", "DATETIME")]
-    final_columns = columns + additional_columns
-
-    # Prepare the base query
-    base_query = f"SELECT * FROM {source_table}"
+    # Ensure `update_columns` is not empty before proceeding
+    if not update_columns:
+        logging.error(f"No update columns provided for `{destination_table}`. This should have been handled in main.py.")
+        return  # Skip updates if no update columns
 
     # Apply `since` filter if provided
-    date_filter = None
-    if since and sort_column:
+    where_conditions = [f"{sort_column} IS NOT NULL"]  # Ignore rows with NULL sort_column
+    if since:
         look_back_date = (datetime.now() - timedelta(days=since)).strftime('%Y-%m-%d')
-        date_filter = f"{sort_column} IS NOT NULL AND {sort_column} > '{look_back_date}'"
-    else:
-        date_filter = f"{sort_column} IS NOT NULL"  # Ignore rows with NULL sort_column
+        where_conditions.append(f"{sort_column} > '{look_back_date}'")
 
-    # Finalize the query with filters and sorting
-    where_clause = f"WHERE {date_filter}" if date_filter else ""
-    query = f"{base_query} {where_clause} ORDER BY {sort_column}"
+    where_clause = f"WHERE {' AND '.join(where_conditions)}"
+
+    # Construct query with proper ORDER BY (remove backticks for ODBC)
+    query = f"""
+        SELECT * FROM {source_table}
+        {where_clause}
+        ORDER BY {sort_column}
+    """
     logging.info(f"Executing query: {query}")
 
-    # Prepare the update query for MySQL
+    # Prepare update query
+    update_fields = [f"`{col}`=VALUES(`{col}`)" for col in update_columns]
+    update_fields.append("`updated_at`=VALUES(`updated_at`)")  # Always update timestamp
     update_query = f"""
-        INSERT INTO `{destination_table}` ({', '.join([f"`{col[0]}`" for col in final_columns])})
-        VALUES ({', '.join(['%s'] * len(final_columns))})
-        ON DUPLICATE KEY UPDATE
-        {', '.join([f"`{col}`=VALUES(`{col}`)" for col in update_columns])},
-        `updated_at`=VALUES(`updated_at`)
+        INSERT INTO `{destination_table}` ({', '.join([f"`{col[0]}`" for col in columns])})
+        VALUES ({', '.join(['%s'] * len(columns))})
+        ON DUPLICATE KEY UPDATE {', '.join(update_fields)}
     """
 
     try:
@@ -296,7 +297,6 @@ def fetch_and_update_rows(
 
             for row in chunk:
                 try:
-                    # Process the row based on the original ODBC columns
                     processed_row = process_row(row, columns, exceptions, trim_trailing_spaces)
 
                     # Append `created_at` and `updated_at` timestamps for insertion
